@@ -1,0 +1,94 @@
+[
+  {
+    "id": 1,
+    "date": "2026-10-24",
+    "answers": [
+      {
+        "level": 0,
+        "group": "BASIC COLORS",
+        "members": [
+          "RED",
+          "BLUE",
+          "GREEN",
+          "YELLOW"
+        ]
+      },
+      {
+        "level": 1,
+        "group": "TABLEWARE",
+        "members": [
+          "FORK",
+          "SPOON",
+          "PLATE",
+          "BOWL"
+        ]
+      },
+      {
+        "level": 2,
+        "group": "BODY PARTS",
+        "members": [
+          "HAND",
+          "FOOT",
+          "ARM",
+          "LEG"
+        ]
+      },
+      {
+        "level": 3,
+        "group": "FARM ANIMALS",
+        "members": [
+          "COW",
+          "PIG",
+          "SHEEP",
+          "GOAT"
+        ]
+      }
+    ]
+  },
+  {
+    "id": 2,
+    "date": "2026-10-25",
+    "answers": [
+      {
+        "level": 0,
+        "group": "GARDEN TOOLS",
+        "members": [
+          "RAKE",
+          "SPADE",
+          "HOE",
+          "TROWEL"
+        ]
+      },
+      {
+        "level": 1,
+        "group": "PLANETS",
+        "members": [
+          "MARS",
+          "VENUS",
+          "EARTH",
+          "SATURN"
+        ]
+      },
+      {
+        "level": 2,
+        "group": "FOOTWEAR",
+        "members": [
+          "BOOT",
+          "SANDAL",
+          "SLIPPER",
+          "SNEAKER"
+        ]
+      },
+      {
+        "level": 3,
+        "group": "SEASONS",
+        "members": [
+          "SPRING",
+          "SUMMER",
+          "AUTUMN",
+          "WINTER"
+        ]
+      }
+    ]
+  }
+]
