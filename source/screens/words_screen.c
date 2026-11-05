@@ -82,6 +82,9 @@ static GameSaveCustomPuzzle pending_custom_data;
 static ConnectionsPuzzle pending_race_data;
 static bool pending_race = false, racing = false, race_completed = false;
 static bool race_failed = false;
+typedef enum { WORD_PROMPT_NONE, WORD_PROMPT_QUIT, WORD_PROMPT_SOLUTIONS } WordPrompt;
+static WordPrompt prompt = WORD_PROMPT_NONE;
+static bool prompt_yes = false;
 static Image mistake_images[8];
 static bool mistake_images_loaded = false;
 
@@ -682,6 +685,8 @@ void words_screen_init(void) {
     racing = pending_race;
     race_completed = false;
     race_failed = false;
+    prompt = WORD_PROMPT_NONE;
+    prompt_yes = false;
     if (pending_race) {
         puzzle = pending_race_data;
         puzzle_loaded = true;
@@ -703,7 +708,7 @@ void words_screen_init(void) {
     memset(chosen_words, 0, sizeof(chosen_words));
     memset(solved_group_ids, 0, sizeof(solved_group_ids));
     solved_group_count = 0;
-    if (racing) shuffle_current_puzzle_words();
+    // Race puzzles already carry the host's shared word layout.
     last_nav_time = 0;
     can_press_a = false;
     clear_submit_message();
@@ -752,9 +757,76 @@ bool words_screen_take_race_failed(void) {
     return failed;
 }
 
+static void open_prompt(WordPrompt next) {
+    prompt = next;
+    prompt_yes = false;
+    can_press_a = false;
+    last_nav_time = SDL_GetTicks();
+}
+
+static ScreenResult update_prompt(PlatformInput input, Uint32 now) {
+    if ((input.left || input.right || input.up || input.down) &&
+        now - last_nav_time >= WORD_GRID_NAV_DELAY_MS) {
+        prompt_yes = !prompt_yes;
+        last_nav_time = now;
+    }
+    bool confirm = input.a;
+    if (input.touch && point_in_rect(input.touch_x, input.touch_y, 336, 370, 280, 58)) {
+        prompt_yes = true;
+        confirm = true;
+    } else if (input.touch && point_in_rect(input.touch_x, input.touch_y, 664, 370, 280, 58)) {
+        prompt_yes = false;
+        confirm = true;
+    }
+    if (input.b) { prompt_yes = false; confirm = true; }
+    if (!confirm) return (ScreenResult){ SCREEN_WORDS };
+
+    WordPrompt answered = prompt;
+    prompt = WORD_PROMPT_NONE;
+    can_press_a = false;
+    if (answered == WORD_PROMPT_QUIT) {
+        return (ScreenResult){ prompt_yes ? SCREEN_MAIN_MENU : SCREEN_WORDS };
+    }
+    if (!prompt_yes) {
+        if (racing) race_failed = true;
+        return (ScreenResult){ racing ? SCREEN_WORDS : SCREEN_MAIN_MENU };
+    }
+
+    // Reveal through the existing solved-row renderer without awarding a solve.
+    for (int group = 0; group < CONNECTIONS_GROUP_COUNT; group++) {
+        if (!group_is_already_solved(group))
+            solved_group_ids[solved_group_count++] = group;
+    }
+    rebuild_word_order();
+    deselect_all_words();
+    clear_submit_message();
+    shake_start_time = 0;
+    cursor_index = WORD_CURSOR_NEXT;
+    return (ScreenResult){ SCREEN_WORDS };
+}
+
+static void draw_prompt(void) {
+    if (prompt == WORD_PROMPT_NONE) return;
+    drawing_rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0x88000000);
+    drawing_round_rect(300, 230, 680, 250, 12, COLOR_WHITE);
+    const char *title = prompt == WORD_PROMPT_QUIT ? "Quit current puzzle?" : "View solutions?";
+    draw_centered_text(title, 320, 275, 640, 42, 3, COLOR_BLACK);
+    for (int i = 0; i < 2; i++) {
+        int x = i ? 664 : 336;
+        bool selected = prompt_yes == (i == 0);
+        drawing_round_rect(x, 370, 280, 58, 29, selected ? COLOR_BLACK : COLOR_WHITE);
+        drawing_round_rect_outline(x, 370, 280, 58, 29, 2, COLOR_BLACK);
+        if (selected) drawing_round_rect_outline(x - 4, 366, 288, 66, 33, 2, 0xFFDC7328);
+        draw_centered_text(i ? "No" : "Yes", x, 370, 280, 58, 3,
+                           selected ? COLOR_WHITE : COLOR_BLACK);
+    }
+}
+
 ScreenResult words_screen_update(PlatformInput input) {
     Uint32 now = SDL_GetTicks();
     bool activate_cursor = false;
+
+    if (prompt != WORD_PROMPT_NONE) return update_prompt(input, now);
 
     if (input.touch) {
         int touched_cursor = touch_cursor_index(input.touch_x, input.touch_y);
@@ -843,9 +915,10 @@ ScreenResult words_screen_update(PlatformInput input) {
 
     if (activate_cursor) {
         if (cursor_index == WORD_CURSOR_QUIT) {
-            return (ScreenResult){ SCREEN_MAIN_MENU };
+            open_prompt(WORD_PROMPT_QUIT);
         } else if (cursor_index == WORD_CURSOR_NEXT && puzzle_is_complete()) {
-            start_next_puzzle();
+            if (racing) race_failed = true; // Continue after viewing a failed puzzle.
+            else start_next_puzzle();
         } else if (cursor_is_word()) {
             if (chosen_words[cursor_index] || chosen_word_count() < 4) {
                 if (!word_is_solved(cursor_index)) {
@@ -869,13 +942,6 @@ ScreenResult words_screen_update(PlatformInput input) {
                     }
                     cursor_index = WORD_CURSOR_NEXT;
                 }
-            } else if (mistakes_remaining <= 0) {
-                can_press_a = false;
-                if (racing) {
-                    race_failed = true;
-                    return (ScreenResult){ SCREEN_WORDS };
-                }
-                return (ScreenResult){ SCREEN_MAIN_MENU };
             } else {
                 mistakes_remaining--;
                 show_submit_message(
@@ -883,6 +949,7 @@ ScreenResult words_screen_update(PlatformInput input) {
                     now
                 );
                 shake_start_time = now;
+                if (mistakes_remaining == 0) open_prompt(WORD_PROMPT_SOLUTIONS);
             }
         }
 
@@ -955,6 +1022,7 @@ void words_screen_draw(void) {
     draw_timer();
     draw_action_buttons();
     draw_submit_message();
+    draw_prompt();
 }
 
 void words_screen_exit(void) {

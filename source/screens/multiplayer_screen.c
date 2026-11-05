@@ -13,9 +13,11 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef enum { WIFI_CHOICE, SESSION } EntryState;
+typedef enum { WIFI_CHOICE, LOCAL_BROWSER, SESSION } EntryState;
 static EntryState entry;
 static bool use_local, active_puzzle;
+static bool leave_confirm, leave_selected;
+static unsigned local_selection;
 static MpSnapshot snapshot;
 static MpRules rules;
 static unsigned selection, scroll, local_score, puzzle_index;
@@ -145,6 +147,7 @@ void multiplayer_screen_init(void) {
     if (!preparer || SDL_AtomicGet(&prepared)) { release_library(); prepared_match = 0; }
     active_puzzle = false; ui_error[0] = 0;
     count_published = false; lobby_focus = 0;
+    leave_confirm=leave_selected=false; local_selection=0;
     mp_set_library(NULL,0,0);
     solved_count_published = false;
     if (!winner_crown_loaded)
@@ -157,10 +160,7 @@ void multiplayer_screen_init(void) {
     const LocalPlayerProfile *profile = platform_player_profile_get();
     snprintf(name, sizeof(name), "%s", profile->nickname);
     appearance_published = false;
-    if (use_local) {
-        entry = SESSION;
-        if (!mp_begin_local(name)) strcpy(ui_error, "Local discovery unavailable");
-    } else entry = WIFI_CHOICE;
+    entry = WIFI_CHOICE;
 }
 static uint64_t elapsed_us(void) {
     uint64_t now = SDL_GetPerformanceCounter();
@@ -171,6 +171,7 @@ static void advance_puzzle(void) {
     if (!library_count) return;
     ConnectionsPuzzle next;
     if(!mp_race_puzzle(snapshot.match_id,puzzle_index,&next)) {strcpy(ui_error,"Local race puzzle unavailable");return;}
+    if (!mp_set_progress(puzzle_index)) {strcpy(ui_error,"Unable to queue race progress");return;}
     ++puzzle_index;
     words_screen_open_race_puzzle(&next);
     active_puzzle = true;
@@ -222,8 +223,26 @@ static void edit_rule_value(void) {
     if (!mp_set_rules(rules)) strcpy(ui_error, "Unable to queue rule change");
     else ui_error[0] = 0;
 }
+static void prepare_shared_match(void) {
+    if (snapshot.match_id && prepared_match != snapshot.match_id && (snapshot.state == MP_PREPARING || snapshot.state == MP_STARTING || snapshot.state == MP_PLAYING)) {
+        if (!snapshot.race_ready) return;
+        ConnectionsPuzzle first;
+        bool usable=mp_race_puzzle(snapshot.match_id,0,&first);
+        if (!mp_ready(usable)) return;
+        if (!usable) {
+            strcpy(ui_error,"Unable to prepare local race sequence");
+            return;
+        }
+        prepared_match=snapshot.match_id;local_score=puzzle_index=0;active_puzzle=false;ui_error[0]=0;
+        for (unsigned i=0;i<snapshot.player_count;i++) if (snapshot.players[i].id==snapshot.own_id) {
+            local_score=snapshot.players[i].score;puzzle_index=snapshot.players[i].puzzle_index;
+        }
+    }
+}
 ScreenResult multiplayer_screen_update(PlatformInput input) {
-    if (input.b) { mp_stop(); return (ScreenResult){SCREEN_MAIN_MENU}; }
+    if (input.b && !leave_confirm) {
+        leave_confirm=true;leave_selected=false;input=(PlatformInput){0};
+    }
     Uint32 now = SDL_GetTicks();
     bool refresh = (Sint32)(now-next_snapshot) >= 0;
     // Consume published changes at 20 Hz, never poll sockets or discovery here.
@@ -235,40 +254,68 @@ ScreenResult multiplayer_screen_update(PlatformInput input) {
                 (!strcmp(ui_error,"Waiting for every player's puzzle count") ||
                  !strcmp(ui_error,"Preparing local puzzles..."))) ui_error[0]=0;
             cache_avatars();
-            if(snapshot.error[0])snprintf(ui_error,sizeof(ui_error),"%s",snapshot.error);
+            if(snapshot.error[0]) {
+                snprintf(ui_error,sizeof(ui_error),"%s",snapshot.error);
+                if (use_local && snapshot.state==MP_DISCOVERING && entry==SESSION) entry=LOCAL_BROWSER;
+            }
         }
     }
     if (preparer && SDL_AtomicGet(&prepared)) {
         SDL_WaitThread(preparer,NULL); preparer=NULL;
         if (SDL_AtomicGet(&prepared) < 0) strcpy(ui_error, "No usable local puzzles");
     }
-    if (refresh && !count_published && !preparer)
-        count_published = mp_set_library(library,(unsigned)library_count,(unsigned)library_entries);
+    if (refresh && !count_published && !preparer) {
+        count_published=mp_set_library(library,(unsigned)library_count,(unsigned)library_entries);
+        if (count_published) library=NULL; // Worker owns the submitted library.
+    }
     if (refresh && !solved_count_published && !preparer)
         solved_count_published = mp_set_solved_count(device_solved_count);
-    if (refresh && !appearance_published && entry==SESSION) {
+    if (refresh && !appearance_published && entry!=WIFI_CHOICE) {
         const LocalPlayerProfile *profile=platform_player_profile_get();
         appearance_published=mp_set_appearance(profile->color_id,profile->color,profile->avatar_rgba);
+    }
+    prepare_shared_match();
+    if (leave_confirm) {
+        if ((input.left || input.right || input.up || input.down) && now-last_nav>=180) {
+            leave_selected=!leave_selected;last_nav=now;
+        }
+        bool confirm=input.a;
+        if (touched(input,336,370,280,58)) {leave_selected=false;confirm=true;}
+        if (touched(input,664,370,280,58)) {leave_selected=true;confirm=true;}
+        if (input.b || (confirm && !leave_selected)) leave_confirm=false;
+        else if (confirm) {mp_stop();return (ScreenResult){SCREEN_MAIN_MENU};}
+        return (ScreenResult){SCREEN_MULTIPLAYER};
+    }
+    if (entry==LOCAL_BROWSER) {
+        unsigned count=snapshot.local_lobby_count;
+        if (count && local_selection>=count) local_selection=count-1;
+        if (count && (input.up || input.down) && now-last_nav>=180) {
+            local_selection=(local_selection+(input.down?1:count-1))%count;last_nav=now;
+        }
+        bool join=input.a;
+        for (unsigned i=0;i<count;i++) if (touched(input,200,160+(int)i*58,880,48)) {local_selection=i;join=true;}
+        if (join && count && mp_join_local(snapshot.local_lobbies[local_selection].id)) {
+            entry=SESSION;ui_error[0]=0;appearance_published=false;
+        }
+        return (ScreenResult){SCREEN_MULTIPLAYER};
     }
     if (entry == WIFI_CHOICE) {
         if ((input.up || input.down) && now-last_nav >= 180) { selection ^= 1; last_nav = now; }
         if (touched(input,410,300,460,58)) { selection=0; input.a=true; }
         if (touched(input,410,390,460,58)) { selection=1; input.a=true; }
-        if (input.a) begin_wifi(selection == 0);
+        if (input.a) {
+            if (!use_local) begin_wifi(selection==0);
+            else if (selection==0) {
+                if (mp_begin_local_host(name)) {entry=SESSION;appearance_published=false;ui_error[0]=0;}
+                else strcpy(ui_error,"Unable to queue local host");
+            } else {
+                if (mp_discover_local(name)) {entry=LOCAL_BROWSER;local_selection=0;appearance_published=false;ui_error[0]=0;}
+                else strcpy(ui_error,"Local discovery unavailable");
+            }
+        }
         return (ScreenResult){SCREEN_MULTIPLAYER};
     }
-    if (snapshot.match_id && prepared_match != snapshot.match_id && (snapshot.state == MP_PREPARING || snapshot.state == MP_STARTING || snapshot.state == MP_PLAYING)) {
-        if (!count_published || preparer) return (ScreenResult){SCREEN_MULTIPLAYER};
-        ConnectionsPuzzle first;
-        bool usable=mp_race_puzzle(snapshot.match_id,0,&first);
-        if (snapshot.state==MP_PREPARING && !mp_ready(usable)) return (ScreenResult){SCREEN_MULTIPLAYER};
-        if (!usable) {
-            strcpy(ui_error,"Unable to prepare local race sequence");
-            return (ScreenResult){SCREEN_MULTIPLAYER};
-        }
-        prepared_match=snapshot.match_id;local_score=puzzle_index=0;active_puzzle=false;ui_error[0]=0;
-    }
-    if (snapshot.state == MP_PLAYING) {
+    if (snapshot.state == MP_PLAYING && snapshot.race_ready && prepared_match==snapshot.match_id) {
         if (input.select && snapshot.player_count > 4) scroll = (scroll+1) % (snapshot.player_count-3);
         uint64_t elapsed = elapsed_us();
         bool expired = snapshot.rules.mode == MP_TIMED && elapsed >= (uint64_t)snapshot.rules.duration_seconds*1000000;
@@ -276,7 +323,9 @@ ScreenResult multiplayer_screen_update(PlatformInput input) {
         if (!active_puzzle && !expired && !target_done) advance_puzzle();
         if (active_puzzle && !expired && !target_done) {
             ScreenResult result = words_screen_update(input);
-            if (result.next_screen == SCREEN_MAIN_MENU) { mp_stop(); return result; }
+            if (result.next_screen==SCREEN_MAIN_MENU) {
+                mp_stop();return (ScreenResult){SCREEN_MAIN_MENU};
+            }
             if (words_screen_take_race_completed()) {
                 elapsed = elapsed_us();
                 if (snapshot.rules.mode != MP_TIMED || elapsed < (uint64_t)snapshot.rules.duration_seconds*1000000) {
@@ -376,9 +425,25 @@ void multiplayer_screen_draw(void) {
         if(snapshot.state==MP_FINALIZING) drawing_text("FINALIZING...",20,610,1,COLOR_BLACK);
     } else {
         drawing_rect(0,0,SCREEN_WIDTH,SCREEN_HEIGHT,COLOR_MENU_BG);
-        const char *heading=snapshot.state==MP_RESULTS?"CONGRATULATIONS!":snapshot.state==MP_LOBBY?"PLAYER LOBBY":"MULTIPLAYER";
+        const char *heading=entry==LOCAL_BROWSER?"LOCAL GAMES":entry==WIFI_CHOICE && use_local?"LOCAL MULTIPLAYER":snapshot.state==MP_RESULTS?"CONGRATULATIONS!":snapshot.state==MP_LOBBY?"PLAYER LOBBY":"MULTIPLAYER";
         drawing_text(heading,640-drawing_text_width(heading,5)/2,50,5,COLOR_BLACK);
         if(entry==WIFI_CHOICE) { button("HOST",300,selection==0); button("JOIN",390,selection==1); }
+        else if(entry==LOCAL_BROWSER) {
+            if (!snapshot.local_lobby_count) {
+                const char *message=snapshot.state==MP_ERROR?snapshot.error:"Searching for local games...";
+                drawing_text(message,220,320,3,COLOR_BLACK);
+            }
+            for (unsigned i=0;i<snapshot.local_lobby_count;i++) {
+                const MpLocalLobby *lobby=&snapshot.local_lobbies[i];int y=160+(int)i*58;bool selected=i==local_selection;
+                drawing_round_rect(200,y,880,48,6,selected?COLOR_BLACK:COLOR_WHITE);
+                if (selected) drawing_round_rect_outline(196,y-4,888,56,10,2,0xFFDC7328);
+                int name_scale=drawing_text_width(lobby->name,3)>520?2:3;
+                drawing_text(lobby->name,220,y+14,name_scale,selected?COLOR_WHITE:COLOR_BLACK);
+                char detail[48];snprintf(detail,sizeof(detail),"%u/%u  %s",lobby->players,lobby->max_players,
+                    lobby->full?"FULL":lobby->playing?"IN MATCH":"LOBBY");
+                drawing_text(detail,1060-drawing_text_width(detail,2),y+17,2,selected?COLOR_WHITE:COLOR_BLACK);
+            }
+        }
         else if(snapshot.state==MP_LOBBY) {
             if (platform_graphics_modern()) {
                 drawing_round_rect(250,130,780,240,6,COLOR_WHITE);
@@ -427,12 +492,29 @@ void multiplayer_screen_draw(void) {
                 drawing_text("START: RETURN TO LOBBY",450,650,2,COLOR_WHITE);
             }
         } else {
-            const char *status=snapshot.state==MP_DISCOVERING?"Discovering nearby Switches...":snapshot.state==MP_CONNECTING?"Connecting...":snapshot.state==MP_PREPARING?"Preparing puzzles / waiting for READY...":snapshot.state==MP_STARTING?"Get ready...":snapshot.state==MP_ERROR?snapshot.error:"Starting network...";
+            const char *status=snapshot.state==MP_DISCOVERING?"Discovering nearby Switches...":snapshot.state==MP_CONNECTING?"Connecting...":(snapshot.state==MP_PREPARING || ((snapshot.state==MP_PLAYING || snapshot.state==MP_STARTING) && !snapshot.race_ready))?"Receiving shared puzzles...":snapshot.state==MP_STARTING?"Get ready...":snapshot.state==MP_ERROR?snapshot.error:"Starting network...";
             drawing_text(status,180,330,2,COLOR_BLACK);
         }
     }
     if(ui_error[0]) drawing_text(ui_error,40,630,2,COLOR_BLACK);
-    drawing_text("B: Cancel / Return to menu",28,690,2,COLOR_BLACK);
+    drawing_text("B: Leave multiplayer",28,690,2,COLOR_BLACK);
+    if (leave_confirm) {
+        drawing_rect(0,0,SCREEN_WIDTH,SCREEN_HEIGHT,0x88000000);
+        drawing_round_rect(300,230,680,250,12,COLOR_WHITE);
+        const char *title="LEAVE MULTIPLAYER?";
+        drawing_text_bold(title,640-drawing_text_bold_width(title,3)/2,266,3,COLOR_BLACK);
+        const char *message=snapshot.is_host?"Leaving ends this session.":"Return to the main menu?";
+        drawing_text(message,640-drawing_text_width(message,2)/2,318,2,COLOR_BLACK);
+        for (int i=0;i<2;i++) {
+            int x=i?664:336;bool selected=leave_selected==(i!=0);
+            drawing_round_rect(x,370,280,58,29,selected?COLOR_BLACK:COLOR_WHITE);
+            drawing_round_rect_outline(x,370,280,58,29,2,COLOR_BLACK);
+            if (selected) drawing_round_rect_outline(x-4,366,288,66,33,2,0xFFDC7328);
+            const char *label=i?"Yes":"No";
+            drawing_text(label,x+(280-drawing_text_width(label,3))/2,386,3,selected?COLOR_WHITE:COLOR_BLACK);
+        }
+        drawing_text("A: Confirm   B: Stay",336,447,2,COLOR_BLACK);
+    }
 }
 void multiplayer_screen_exit(void) {
     mp_stop(); active_puzzle=false; words_screen_exit();

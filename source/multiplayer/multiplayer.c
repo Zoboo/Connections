@@ -4,6 +4,8 @@
 #include <switch.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -20,11 +22,14 @@ ordering and retransmission. Queues and peer buffers have fixed capacities. */
 #define LOCAL_SCENE 0x434e
 #define DEAD_MS 12000
 #define FINAL_MS 2000
+#define PROTOCOL_VERSION 5
+#define PUZZLE_WIRE_SIZE 808
+#define PREPARE_MS 120000
 enum {
-    W_HELLO=1, W_STATE, W_READY, W_SCORE, W_PING, W_ERROR, W_COUNT, W_SOLVED, W_ICON
+    W_HELLO=1, W_STATE, W_READY, W_SCORE, W_PING, W_ERROR, W_COUNT, W_SOLVED, W_ICON, W_RACE_BEGIN, W_RACE_PUZZLE, W_RACE_END, W_PROGRESS
 };
 enum {
-    C_LOCAL=1, C_WIFI, C_STOP, C_RULES, C_PREPARE, C_READY, C_SCORE, C_COUNT, C_SOLVED, C_APPEARANCE, C_RETURN_LOBBY
+    C_LOCAL=1, C_WIFI, C_STOP, C_RULES, C_PREPARE, C_READY, C_SCORE, C_COUNT, C_SOLVED, C_APPEARANCE, C_RETURN_LOBBY, C_LIBRARY, C_LOCAL_JOIN, C_PROGRESS
 };
 typedef struct {
     int type;
@@ -36,11 +41,12 @@ typedef struct {
     uint64_t elapsed;
     uint8_t color_id, icon_rgba[MP_ICON_BYTES];
     uint32_t profile_color;
+    ConnectionsPuzzle *library;
 }
 Command;
 typedef struct {
     int fd, player;
-    bool connecting;
+    bool connecting, state_pending;
     uint8_t rx[FRAME_MAX], tx[FRAME_MAX*4];
     size_t rn, tn, sent;
     uint64_t last_rx, joined_at;
@@ -48,6 +54,9 @@ typedef struct {
     uint32_t icon_versions[MP_MAX_PLAYERS], icon_offsets[MP_MAX_PLAYERS];
     uint32_t rx_icon_version, rx_icon_offset, rx_profile_color;
     uint8_t rx_icon_color, rx_icon[MP_ICON_BYTES];
+    uint64_t race_tx_match;
+    unsigned race_tx_index;
+    bool race_begin_sent, race_end_sent;
 }
 Peer;
 typedef struct {
@@ -56,7 +65,7 @@ typedef struct {
 }
 IMultiplayerTransport;
 static SDL_Thread *thread;
-static SDL_mutex *queue_lock, *snapshot_lock;
+static SDL_mutex *queue_lock, *snapshot_lock, *race_lock;
 static Command queue[QUEUE_MAX];
 static unsigned qread, qcount;
 static atomic_bool quit;
@@ -76,12 +85,18 @@ static MpPlayer previous_players[MP_MAX_PLAYERS];
 static uint32_t own_sequence, score_sequences[MP_MAX_PLAYERS];
 static Mutex socket_lifetime_lock;
 static unsigned socket_users;
-/* Main-thread cache: workers never dereference the caller-owned library. */
-static const ConnectionsPuzzle *race_library;
-static unsigned race_library_count;
-static uint64_t race_sequence_match;
-static uint32_t race_order[MP_MAX_PUZZLES];
-static uint8_t race_word_order[MP_MAX_PUZZLES][CONNECTIONS_WORD_COUNT];
+/* Worker owns libraries/build buffers; UI copies a single published puzzle. */
+static ConnectionsPuzzle *host_library, *cached_race, *receiving_race;
+static unsigned host_library_count, cached_race_count, receiving_count, receiving_index;
+static uint64_t cached_race_match, receiving_match;
+static uint8_t race_digest[32];
+static Sha256Context receiving_hash;
+static LdnNetworkInfo discovered_networks[MP_LOCAL_LOBBIES];
+static uint64_t local_session_id, next_advertise;
+static bool local_host;
+static uint32_t race_random(uint32_t *seed);
+static void local_advertise(void);
+static void queue_race(Peer *peer);
 static void lost_peer(Peer *p);
 static bool drop_peer(Peer *p);
 bool mp_socket_acquire(void) {
@@ -159,6 +174,13 @@ static void transport_stop(void) {
     if(listener>=0) close(listener);
     listener=-1;
     if(ldn_up) {
+        LdnState mode=LdnState_None;
+        if(R_SUCCEEDED(ldnGetState(&mode))) {
+            if(mode==LdnState_StationConnected) { ldnDisconnect(); ldnCloseStation(); }
+            else if(mode==LdnState_Station) ldnCloseStation();
+            else if(mode==LdnState_AccessPointCreated) { ldnDestroyNetwork(); ldnCloseAccessPoint(); }
+            else if(mode==LdnState_AccessPoint) ldnCloseAccessPoint();
+        }
         ldnExit();
         ldn_up=false;
     }
@@ -186,7 +208,7 @@ static bool send_frame(Peer *p,int type,uint32_t seq,const uint8_t *payload,size
     if(p->tn+20+len>sizeof(p->tx)) return false;
     uint8_t *b=p->tx+p->tn;
     memcpy(b,"CNR1",4);
-    b[4]=4;
+    b[4]=PROTOCOL_VERSION;
     b[5]=type;
     b[6]=len>>8;
     b[7]=len;
@@ -196,14 +218,9 @@ static bool send_frame(Peer *p,int type,uint32_t seq,const uint8_t *payload,size
     p->tn+=20+len;
     return true;
 }
-static void broadcast_state(void) {
-    /* Remove slow peers before encoding. This avoids emitting an old membership
-       snapshot after a newer disconnect snapshot to the remaining clients. */
-    for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++) {
-        Peer *p=&peers[i];
-        size_t frame_size=20+16+state.player_count*72;
-        if(p->fd>=0&&p->player>=0&&!p->connecting&&p->tn-p->sent+frame_size>sizeof(p->tx)) drop_peer(p);
-    }
+/* Scoreboards/membership are replaceable snapshots, not an unbounded stream.
+   Coalesce changes and encode the latest state only when the peer has room. */
+static bool send_state(Peer *peer) {
     uint8_t b[700];
     size_t n=0;
     b[n++]=state.state;
@@ -214,9 +231,11 @@ static void broadcast_state(void) {
     n+=4;
     put32(b+n,state.rules.target_score);
     n+=4;
-    uint64_t countdown=0,now=SDL_GetPerformanceCounter();
-    if(state.start_ticks>now)countdown=(state.start_ticks-now)*1000/SDL_GetPerformanceFrequency();
-    put32(b+n,countdown);
+    int32_t timing=0;
+    uint64_t now=SDL_GetPerformanceCounter();
+    if(state.start_ticks>now)timing=(int32_t)((state.start_ticks-now)*1000/SDL_GetPerformanceFrequency());
+    else if(state.start_ticks)timing=-(int32_t)((now-state.start_ticks)*1000/SDL_GetPerformanceFrequency());
+    put32(b+n,(uint32_t)timing);
     n+=4;
     for(unsigned i=0;i<state.player_count;i++) {
         MpPlayer *p=&state.players[i];
@@ -239,11 +258,21 @@ static void broadcast_state(void) {
         n+=4;
         put32(b+n,p->icon_revision);
         n+=4;
+        put32(b+n,p->puzzle_index);
+        n+=4;
     }
-    for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++)if(peers[i].fd>=0&&peers[i].player>=0&&!peers[i].connecting) {
-        send_frame(&peers[i],W_STATE,0,b,n);
-    }
+    return send_frame(peer,W_STATE,0,b,n);
+}
+static void queue_state(Peer *peer) {
+    if(!peer->state_pending||peer->fd<0||peer->player<0||peer->connecting)return;
+    size_t size=20+16+state.player_count*76;
+    if(peer->tn-peer->sent+size<=sizeof(peer->tx)&&send_state(peer))peer->state_pending=false;
+}
+static void broadcast_state(void) {
+    for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++)if(peers[i].fd>=0&&peers[i].player>=0&&!peers[i].connecting)
+        peers[i].state_pending=true;
     dirty=true;
+    local_advertise();
 }
 static bool drop_peer(Peer *p) {
     int idx=p->player;
@@ -259,7 +288,7 @@ static bool drop_peer(Peer *p) {
             state.player_count--;
             for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++) if(peers[i].player>idx) peers[i].player--;
         }
-        else state.players[idx].connected=false;
+        else { state.players[idx].connected=false; state.players[idx].ready=false; }
         return true;
     }
     return false;
@@ -337,69 +366,206 @@ static bool wifi_begin(const Command *c) {
     local_mode=false;
     return setup_socket(c->host,c->ip,c->port);
 }
-static bool local_begin(const Command *c) {
-    (void)c;
-    local_mode=true;
-    if(R_FAILED(ldnInitialize(LdnServiceType_User))) return false;
-    ldn_up=true;
-    if(R_FAILED(ldnOpenStation())) return false;
-    state.state=MP_DISCOVERING;
-    dirty=true;
-    connect_deadline=now_ms()+1200+(own_id%1800);
-    return true;
+static void local_security(LdnSecurityConfig *sec,LdnUserConfig *user) {
+    memset(sec,0,sizeof(*sec)); memset(user,0,sizeof(*user));
+    sec->security_mode=LdnSecurityMode_Product;
+    sec->passphrase_size=16;
+    memcpy(sec->passphrase,"ConnectionsRace1",16);
+    memcpy(user->user_name,state.players[0].name,33);
 }
-static const IMultiplayerTransport WifiTransport= {
-    wifi_begin,transport_stop
-};
-static const IMultiplayerTransport LocalWirelessTransport= {
-    local_begin,transport_stop
-};
-static void local_discover(void) {
-    LdnScanFilter filter= {
-        0
-    };
-    filter.flags=LdnScanFilterFlag_SceneId;
-    filter.network_id.intent_id.scene_id=LOCAL_SCENE;
-    LdnNetworkInfo nets[8]= {
-        0
-    };
-    s32 count=0;
-    if(R_FAILED(ldnScan(0,&filter,nets,8,&count))) {
-        fail("Local discovery unavailable");
-        return;
+static void local_advertise(void) {
+    if(!ldn_up||!local_host||!state.is_host)return;
+    uint8_t ad[49]={0};
+    memcpy(ad,"CN5L",4); put64(ad+4,local_session_id);
+    memcpy(ad+12,state.players[0].name,33);
+    unsigned count=0;
+    for(unsigned i=0;i<state.player_count;i++)if(state.players[i].connected)++count;
+    ad[45]=(uint8_t)count; ad[46]=MP_MAX_PLAYERS;
+    ad[47]=state.state!=MP_LOBBY; ad[48]=PROTOCOL_VERSION;
+    ldnSetAdvertiseData(ad,sizeof(ad));
+}
+static bool local_begin(const Command *c) {
+    local_mode=true; local_host=c->host;
+    state.local_lobby_count=0;
+    if(R_FAILED(ldnInitialize(LdnServiceType_User)))return false;
+    ldn_up=true;
+    if(!c->host) {
+        if(R_FAILED(ldnOpenStation()))return false;
+        state.state=MP_DISCOVERING; dirty=true;
+        return true;
     }
-    LdnSecurityConfig sec= {
-        0
-    };
-    sec.security_mode=LdnSecurityMode_Product;
-    sec.passphrase_size=16;
-    memcpy(sec.passphrase,"ConnectionsRace1",16);
-    LdnUserConfig user= {
-        0
-    };
-    memcpy(user.user_name,state.players[0].name,33);
-    for(int i=0;i<count;i++)if(nets[i].advertise_data_size>=4&&!memcmp(nets[i].advertise_data,"CNR1",4)) {
-        if(R_FAILED(ldnConnect(&sec,&user,1,0,&nets[i])))continue;
-        struct in_addr addr= {
-            htonl(nets[i].nodes[0].ip_addr.addr)
-        };
-        char ip[48];
-        snprintf(ip,sizeof(ip),"%s",inet_ntoa(addr));
-        if(!setup_socket(false,ip,LOCAL_PORT)) fail("Unable to connect locally");
-        return;
-    }
-    if(now_ms()<connect_deadline)return;
-    LdnNetworkConfig config= {
-        0
-    };
+    LdnSecurityConfig sec; LdnUserConfig user;
+    local_security(&sec,&user);
+    LdnNetworkConfig config={0};
     config.intent_id.local_communication_id=-1;
     config.intent_id.scene_id=LOCAL_SCENE;
     config.node_count_max=MP_MAX_PLAYERS;
-    config.local_communication_version=1;
-    if(R_FAILED(ldnCloseStation())||R_FAILED(ldnOpenAccessPoint())||R_FAILED(ldnCreateNetwork(&sec,&user,&config))||R_FAILED(ldnSetAdvertiseData("CNR1",4))||!setup_socket(true,"",LOCAL_PORT)) {
-        fail("Unable to host local wireless");
+    config.local_communication_version=PROTOCOL_VERSION;
+    local_session_id=SDL_GetPerformanceCounter()^own_id;
+    if(!local_session_id)local_session_id=own_id;
+    if(R_FAILED(ldnOpenAccessPoint())||R_FAILED(ldnCreateNetwork(&sec,&user,&config))||
+       !setup_socket(true,"",LOCAL_PORT))return false;
+    local_advertise();
+    return true;
+}
+static const IMultiplayerTransport WifiTransport={wifi_begin,transport_stop};
+static const IMultiplayerTransport LocalWirelessTransport={local_begin,transport_stop};
+static void local_discover(void) {
+    LdnScanFilter filter={0};
+    filter.flags=LdnScanFilterFlag_SceneId;
+    filter.network_id.intent_id.scene_id=LOCAL_SCENE;
+    LdnNetworkInfo nets[MP_LOCAL_LOBBIES]={0}; s32 count=0;
+    if(R_FAILED(ldnScan(0,&filter,nets,MP_LOCAL_LOBBIES,&count))) {
+        fail("Local discovery unavailable"); return;
+    }
+    MpLocalLobby visible[MP_LOCAL_LOBBIES]={0}; unsigned found=0;
+    for(int i=0;i<count&&found<MP_LOCAL_LOBBIES;i++) {
+        const uint8_t *ad=(const uint8_t *)nets[i].advertise_data;
+        if(nets[i].advertise_data_size!=49||memcmp(ad,"CN5L",4)||ad[48]!=PROTOCOL_VERSION||ad[44]||
+           !get64(ad+4)||ad[46]!=MP_MAX_PLAYERS||ad[45]>MP_MAX_PLAYERS||ad[47]>1)continue;
+        MpLocalLobby *lobby=&visible[found];
+        lobby->id=get64(ad+4); memcpy(lobby->name,ad+12,33);
+        lobby->players=ad[45]; lobby->max_players=ad[46];
+        lobby->playing=ad[47]!=0; lobby->full=ad[45]>=ad[46];
+        discovered_networks[found]=nets[i]; ++found;
+    }
+    if(state.local_lobby_count!=found||memcmp(state.local_lobbies,visible,sizeof(visible))) {
+        state.local_lobby_count=found;
+        memcpy(state.local_lobbies,visible,sizeof(visible)); dirty=true;
+    }
+}
+static void local_join(uint64_t id) {
+    if(!local_mode||state.state!=MP_DISCOVERING)return;
+    for(unsigned i=0;i<state.local_lobby_count;i++)if(state.local_lobbies[i].id==id) {
+        if(state.local_lobbies[i].full) {snprintf(state.error,sizeof(state.error),"Lobby full");dirty=true;return;}
+        LdnSecurityConfig sec; LdnUserConfig user;
+        local_security(&sec,&user);
+        if(R_FAILED(ldnConnect(&sec,&user,PROTOCOL_VERSION,0,&discovered_networks[i]))) {
+            snprintf(state.error,sizeof(state.error),"Unable to join local session");dirty=true;return;
+        }
+        struct in_addr addr={htonl(discovered_networks[i].nodes[0].ip_addr.addr)};
+        char ip[48];snprintf(ip,sizeof(ip),"%s",inet_ntoa(addr));
+        state.error[0]=0;
+        if(!setup_socket(false,ip,LOCAL_PORT))fail("Unable to connect locally");
         return;
     }
+    snprintf(state.error,sizeof(state.error),"Session no longer available");dirty=true;
+}
+static void clear_race(void) {
+    SDL_LockMutex(race_lock);
+    ConnectionsPuzzle *old=cached_race;
+    cached_race=NULL; cached_race_count=0; cached_race_match=0;
+    SDL_UnlockMutex(race_lock);
+    free(old); free(receiving_race); receiving_race=NULL;
+    receiving_count=receiving_index=0; receiving_match=0;
+    state.race_ready=false; state.race_count=0;
+}
+static void publish_race(ConnectionsPuzzle *puzzles,unsigned count,uint64_t match) {
+    SDL_LockMutex(race_lock);
+    ConnectionsPuzzle *old=cached_race;
+    cached_race=puzzles; cached_race_count=count; cached_race_match=match;
+    SDL_UnlockMutex(race_lock);
+    free(old);
+    state.race_ready=true; state.race_count=count; dirty=true;
+}
+/* Fixed-width, explicit wire fields; answers are reconstructed from group IDs. */
+static void encode_puzzle(uint8_t *b,const ConnectionsPuzzle *p) {
+    put32(b,(uint32_t)p->id); memcpy(b+4,p->date,16);
+    memcpy(b+20,p->words,16*32); memcpy(b+532,p->group_names,4*64);
+    for(unsigned i=0;i<4;i++)b[788+i]=(uint8_t)p->group_levels[i];
+    for(unsigned i=0;i<16;i++)b[792+i]=(uint8_t)p->group_ids[i];
+}
+static bool wire_text(const uint8_t *p,unsigned size) {
+    const uint8_t *end=memchr(p,0,size);
+    if(!end||end==p)return false;
+    for(const uint8_t *q=p;q<end;q++)if(*q<32)return false;
+    return true;
+}
+static bool decode_puzzle(const uint8_t *b,ConnectionsPuzzle *p) {
+    if(get32(b)>INT_MAX||!wire_text(b+4,16))return false;
+    memset(p,0,sizeof(*p)); p->id=(int)get32(b); memcpy(p->date,b+4,16);
+    unsigned groups[4]={0};
+    for(unsigned i=0;i<4;i++) {
+        if(!wire_text(b+532+i*64,64)||(b[788+i]>3&&b[788+i]!=255))return false;
+        memcpy(p->group_names[i],b+532+i*64,64);p->group_levels[i]=(int8_t)b[788+i];
+    }
+    for(unsigned i=0;i<16;i++) {
+        unsigned group=b[792+i];
+        if(group>=4||groups[group]>=4||!wire_text(b+20+i*32,32))return false;
+        memcpy(p->words[i],b+20+i*32,32);p->group_ids[i]=(int)group;
+        memcpy(p->answers[group][groups[group]++],b+20+i*32,32);
+    }
+    p->word_count=16;return true;
+}
+static bool prepare_host_race(void) {
+    unsigned count=host_library_count;
+    for(unsigned i=0;i<state.player_count;i++)if(state.players[i].connected&&state.players[i].puzzle_count<count)
+        count=state.players[i].puzzle_count;
+    if(!host_library||!count||count>MP_MAX_PUZZLES)return false;
+    for(unsigned i=0;i<host_library_count;i++)if(host_library[i].word_count!=CONNECTIONS_WORD_COUNT)return false;
+    ConnectionsPuzzle *puzzles=calloc(count,sizeof(*puzzles));
+    uint32_t *order=malloc(host_library_count*sizeof(*order));
+    if(!puzzles||!order) {free(puzzles);free(order);return false;}
+    uint32_t seed=(uint32_t)(state.match_id^(state.match_id>>32));if(!seed)seed=1;
+    for(unsigned i=0;i<host_library_count;i++)order[i]=i;
+    for(unsigned i=host_library_count-1;i>0;i--) {
+        unsigned j=race_random(&seed)%(i+1);uint32_t temp=order[i];order[i]=order[j];order[j]=temp;
+    }
+    Sha256Context hash;sha256ContextCreate(&hash);
+    for(unsigned i=0;i<count;i++) {
+        puzzles[i]=host_library[order[i]];
+        for(unsigned j=15;j>0;j--) {
+            unsigned k=race_random(&seed)%(j+1);char word[32];
+            memcpy(word,puzzles[i].words[j],32);memcpy(puzzles[i].words[j],puzzles[i].words[k],32);
+            memcpy(puzzles[i].words[k],word,32);
+            int group=puzzles[i].group_ids[j];puzzles[i].group_ids[j]=puzzles[i].group_ids[k];puzzles[i].group_ids[k]=group;
+        }
+        uint8_t wire[PUZZLE_WIRE_SIZE];encode_puzzle(wire,&puzzles[i]);sha256ContextUpdate(&hash,wire,sizeof(wire));
+    }
+    free(order);sha256ContextGetHash(&hash,race_digest);
+    publish_race(puzzles,count,state.match_id);return true;
+}
+static void queue_race(Peer *peer) {
+    if(!state.is_host||peer->connecting||peer->player<0||!state.race_ready||state.state<MP_PREPARING||state.state>MP_RESULTS||peer->tn-peer->sent>512)return;
+    if(peer->race_tx_match!=state.match_id) {
+        peer->race_tx_match=state.match_id;peer->race_tx_index=0;
+        peer->race_begin_sent=peer->race_end_sent=false;
+    }
+    if(!peer->race_begin_sent) {
+        uint8_t begin[36];put32(begin,cached_race_count);memcpy(begin+4,race_digest,32);
+        if(send_frame(peer,W_RACE_BEGIN,0,begin,sizeof(begin)))peer->race_begin_sent=true;
+    } else if(peer->race_tx_index<cached_race_count) {
+        uint8_t item[4+PUZZLE_WIRE_SIZE];put32(item,peer->race_tx_index);
+        encode_puzzle(item+4,&cached_race[peer->race_tx_index]);
+        if(send_frame(peer,W_RACE_PUZZLE,0,item,sizeof(item)))++peer->race_tx_index;
+    } else if(!peer->race_end_sent) {
+        if(send_frame(peer,W_RACE_END,0,race_digest,32))peer->race_end_sent=true;
+    }
+}
+static bool receive_race(int type,uint64_t match,const uint8_t *b,size_t n) {
+    if(state.is_host||!match||match!=state.match_id)return false;
+    if(type==W_RACE_BEGIN) {
+        if(n!=36||!get32(b)||get32(b)>MP_MAX_PUZZLES)return false;
+        clear_race();receiving_count=get32(b);receiving_match=match;
+        receiving_race=calloc(receiving_count,sizeof(*receiving_race));
+        if(!receiving_race)return false;
+        memcpy(race_digest,b+4,32);sha256ContextCreate(&receiving_hash);
+        state.race_count=receiving_count;dirty=true;return true;
+    }
+    if(!receiving_race||receiving_match!=match)return false;
+    if(type==W_RACE_PUZZLE) {
+        if(n!=4+PUZZLE_WIRE_SIZE||get32(b)!=receiving_index||receiving_index>=receiving_count||
+           !decode_puzzle(b+4,&receiving_race[receiving_index]))return false;
+        sha256ContextUpdate(&receiving_hash,b+4,PUZZLE_WIRE_SIZE);++receiving_index;return true;
+    }
+    if(type==W_RACE_END) {
+        uint8_t digest[32];sha256ContextGetHash(&receiving_hash,digest);
+        if(n!=32||receiving_index!=receiving_count||memcmp(digest,b,32)||memcmp(digest,race_digest,32))return false;
+        ConnectionsPuzzle *ready=receiving_race;receiving_race=NULL;
+        publish_race(ready,receiving_count,match);receiving_count=receiving_index=0;receiving_match=0;
+        return true;
+    }
+    return false;
 }
 static bool valid_rules(MpRules r) {
     return (r.mode==MP_TIMED||r.mode==MP_TARGET_SCORE)&&r.duration_seconds>=30&&r.duration_seconds<=3600&&r.target_score>=1&&r.target_score<=MP_MAX_PUZZLES;
@@ -428,6 +594,7 @@ static void maybe_start(void) {
 static void score(int idx,uint32_t seq,uint32_t value,uint64_t elapsed) {
     if(idx<0||idx>=(int)state.player_count||!state.players[idx].connected||(state.state!=MP_PLAYING&&state.state!=MP_FINALIZING))return;
     MpPlayer *p=&state.players[idx];
+    if(!p->ready)return;
     uint64_t host_elapsed=(SDL_GetPerformanceCounter()-state.start_ticks)*1000000/SDL_GetPerformanceFrequency();
     if(seq<=score_sequences[idx]||value!=p->score+1||elapsed<p->elapsed_us||elapsed>host_elapsed+2000000||value>1000000)return;
     if(state.rules.mode==MP_TIMED&&elapsed>(uint64_t)state.rules.duration_seconds*1000000)return;
@@ -524,6 +691,7 @@ static bool receive_message(Peer *peer,int type,uint64_t match,uint32_t seq,cons
     if(type==W_PING)return n==0;
     /* Appearance is session data, not match data: a queued chunk may cross START. */
     if(type==W_ICON)return receive_icon(peer,b,n);
+    if(type==W_RACE_BEGIN||type==W_RACE_PUZZLE||type==W_RACE_END)return receive_race(type,match,b,n);
     if(type==W_ERROR&&!state.is_host) {
         if(!n||n>=sizeof(state.error))return false;
         char error[96];
@@ -534,37 +702,38 @@ static bool receive_message(Peer *peer,int type,uint64_t match,uint32_t seq,cons
     }
     if(state.is_host) {
         if(type==W_HELLO) {
-            if(n!=54||(get32(b+50)>>24)!=255||get32(b+41)>MP_MAX_PUZZLES||peer->player>=0||state.state!=MP_LOBBY||state.player_count>=MP_MAX_PLAYERS)return false;
-            uint64_t id=get64(b);
-            if(!id)return false;
-            for(unsigned i=0;i<state.player_count;i++)if(state.players[i].id==id)return false;
-            if(b[40]!=0)return false;
-            int idx=state.player_count++;
-            peer->player=idx;
-            MpPlayer *p=&state.players[idx];
-            memset(p,0,sizeof(*p));
-            p->id=id;
-            p->connected=true;
-            p->puzzle_count=get32(b+41);
-            p->solved_count=get32(b+45);
-            p->color_id=b[49];
-            p->profile_color=get32(b+50);
+            if(n!=54||(get32(b+50)>>24)!=255||get32(b+41)>MP_MAX_PUZZLES||peer->player>=0||b[40])return false;
+            uint64_t id=get64(b);if(!id||id==own_id)return false;
+            int idx=-1;
+            for(unsigned i=0;i<state.player_count;i++)if(state.players[i].id==id)idx=(int)i;
+            bool returning=idx>=0;
+            if(!returning&&(state.state!=MP_LOBBY||state.player_count>=MP_MAX_PLAYERS)) {
+                const char *error=state.state==MP_LOBBY?"Lobby full":"Match in progress; rejoin only";
+                send_frame(peer,W_ERROR,0,(const uint8_t *)error,strlen(error));
+                send(peer->fd,peer->tx,peer->tn,0);close_peer(peer);return true;
+            }
+            if(returning) {
+                for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++)if(&peers[i]!=peer&&peers[i].player==idx)close_peer(&peers[i]);
+            } else idx=(int)state.player_count++;
+            peer->player=idx;MpPlayer *p=&state.players[idx];
+            if(!returning)memset(p,0,sizeof(*p));
+            p->id=id;p->connected=true;p->ready=false;
+            score_sequences[idx]=0;
+            p->puzzle_count=get32(b+41);p->solved_count=get32(b+45);p->color_id=b[49];p->profile_color=get32(b+50);
             for(unsigned j=0;j<32&&b[8+j];j++)p->name[j]=b[8+j]>=32?(char)b[8+j]:'?';
             p->name[32]=0;
-            cap_rules();
-            broadcast_state();
-            return true;
+            cap_rules();broadcast_state();return true;
         }
         if(peer->player<0)return false;
         // Reliable packets can still belong to a match that has just ended.
         if(match!=state.match_id)
-            return (type==W_SCORE&&n==12)||(type==W_READY&&n==5);
-        if(type==W_SOLVED&&n==4&&(state.state==MP_LOBBY||state.state==MP_PREPARING)) {
+            return (type==W_SCORE&&n==12)||(type==W_READY&&n==5)||(type==W_PROGRESS&&n==4);
+        if(type==W_SOLVED&&n==4) {
             state.players[peer->player].solved_count=get32(b);
             broadcast_state();
             return true;
         }
-        if(type==W_COUNT&&n==4&&(state.state==MP_LOBBY||state.state==MP_PREPARING)) {
+        if(type==W_COUNT&&n==4) {
             uint32_t count=get32(b);
             if(count>MP_MAX_PUZZLES)return false;
             state.players[peer->player].puzzle_count=count;
@@ -572,18 +741,16 @@ static bool receive_message(Peer *peer,int type,uint64_t match,uint32_t seq,cons
             broadcast_state();
             return true;
         }
-        if(type==W_READY&&n==5&&state.state==MP_PREPARING) {
-            uint32_t count=get32(b+1);
-            if(count>MP_MAX_PUZZLES)return false;
-            if(!b[0]||!count||(state.rules.mode==MP_TARGET_SCORE&&count<state.rules.target_score)) {
-                lost_peer(peer);
-                return true;
-            }
-            state.players[peer->player].puzzle_count=count;
-            state.players[peer->player].ready=true;
-            broadcast_state();
-            maybe_start();
-            return true;
+        if(type==W_READY&&n==5&&(state.state==MP_PREPARING||state.state==MP_STARTING||state.state==MP_PLAYING)) {
+            if(!b[0]||!peer->race_end_sent||get32(b+1)!=cached_race_count)return false;
+            state.players[peer->player].ready=true;broadcast_state();maybe_start();return true;
+        }
+        if(type==W_READY&&n==5)return true;
+        if(type==W_PROGRESS&&n==4) {
+            if(state.state!=MP_PLAYING&&state.state!=MP_STARTING)return true;
+            MpPlayer *p=&state.players[peer->player];uint32_t index=get32(b);
+            if(index<p->puzzle_index||index>p->puzzle_index+1||index>1000000)return false;
+            p->puzzle_index=index;dirty=true;return true;
         }
         if(type==W_SCORE&&n==12) {
             score(peer->player,seq,get32(b),get64(b+4));
@@ -591,7 +758,7 @@ static bool receive_message(Peer *peer,int type,uint64_t match,uint32_t seq,cons
         }
         return false;
     }
-    if(type!=W_STATE||n<16||b[0]>MP_RESULTS||b[1]<1||b[1]>MP_MAX_PLAYERS||n!=16+(size_t)b[1]*72)return false;
+    if(type!=W_STATE||n<16||b[0]>MP_RESULTS||b[1]<1||b[1]>MP_MAX_PLAYERS||n!=16+(size_t)b[1]*76)return false;
     MpRules rules= {
         b[3],get32(b+4),get32(b+8)
     };
@@ -600,6 +767,7 @@ static bool receive_message(Peer *peer,int type,uint64_t match,uint32_t seq,cons
     unsigned previous_count=state.player_count;
     MpState previous=state.state;
     uint64_t previous_match=state.match_id;
+    if(previous_match!=match)clear_race();
     state.state=b[0];
     state.player_count=b[1];
     state.winner_mask=b[2];
@@ -634,25 +802,37 @@ static bool receive_message(Peer *peer,int type,uint64_t match,uint32_t seq,cons
         p->color_id=b[off+63];
         p->profile_color=get32(b+off+64);
         if((p->profile_color>>24)!=255)return false;
-        off+=72;
+        p->puzzle_index=get32(b+off+72);
+        if(p->puzzle_index>1000000)return false;
+        off+=76;
     }
     if(!found)return false;
     /* Loading may finish while HELLO is already in flight. Advertise that count
        once the host has admitted us, rather than waiting for a UI retry. */
-    if(previous==MP_CONNECTING&&state.state==MP_LOBBY) {
+    if(previous==MP_CONNECTING) {
         uint8_t count[4];
         put32(count,local_puzzle_count);
         if(!send_frame(peer,W_COUNT,0,count,4))return false;
         put32(count,local_solved_count);
         if(!send_frame(peer,W_SOLVED,0,count,4))return false;
     }
-    if(state.state==MP_STARTING&&(previous!=MP_STARTING||previous_match!=match))state.start_ticks=ticks_after(get32(b+12));
+    if(state.state==MP_STARTING||state.state==MP_PLAYING||state.state==MP_FINALIZING||state.state==MP_RESULTS) {
+        if(previous==MP_CONNECTING||previous_match!=match||previous!=state.state) {
+            int32_t timing=(int32_t)get32(b+12);
+            if(timing>=0)state.start_ticks=ticks_after((uint32_t)timing);
+            else {
+                uint64_t elapsed=(uint64_t)(-(int64_t)timing)*SDL_GetPerformanceFrequency()/1000;
+                uint64_t now=SDL_GetPerformanceCounter();state.start_ticks=now>elapsed?now-elapsed:1;
+            }
+        }
+    } else state.start_ticks=0;
     dirty=true;
     return true;
 }
 static void process_command(Command c) {
     if(c.type==C_LOCAL||c.type==C_WIFI) {
         transport_stop();
+        clear_race();
         memset(&state,0,sizeof(state));
         memset(score_sequences,0,sizeof(score_sequences));
         own_sequence=0;
@@ -681,6 +861,11 @@ static void process_command(Command c) {
         }
         if(!transport->begin(&c))fail(c.type==C_LOCAL?"Local discovery unavailable":"Unable to host or connect");
     }
+    else if(c.type==C_LOCAL_JOIN) {local_join(c.elapsed);}
+    else if(c.type==C_LIBRARY) {
+        free(host_library);host_library=c.library;host_library_count=c.score;
+        process_command((Command){.type=C_COUNT,.score=c.score});
+    }
     else if(c.type==C_APPEARANCE) {
         local_color=c.color_id;
         local_profile_color=c.profile_color;
@@ -697,6 +882,7 @@ static void process_command(Command c) {
     }
     else if(c.type==C_STOP) {
         transport_stop();
+        clear_race();
         state.state=MP_INACTIVE;
         dirty=true;
     }
@@ -712,7 +898,7 @@ static void process_command(Command c) {
             cap_rules();
             broadcast_state();
         }
-        else if(!state.is_host&&(state.state==MP_LOBBY||state.state==MP_PREPARING)) {
+        else if(!state.is_host&&state.player_count&&state.state>=MP_LOBBY&&state.state<=MP_RESULTS) {
             uint8_t b[4];
             put32(b,c.score);
             if(!send_frame(&peers[0],W_COUNT,0,b,4))fail("Network send queue full");
@@ -722,7 +908,7 @@ static void process_command(Command c) {
         local_solved_count=c.score;
         for(unsigned i=0;i<state.player_count;i++) if(state.players[i].id==own_id)state.players[i].solved_count=c.score;
         if(state.is_host&&state.state==MP_LOBBY)broadcast_state();
-        else if(!state.is_host&&(state.state==MP_LOBBY||state.state==MP_PREPARING)) {
+        else if(!state.is_host&&state.player_count&&state.state>=MP_LOBBY&&state.state<=MP_RESULTS) {
             uint8_t b[4];
             put32(b,c.score);
             if(!send_frame(&peers[0],W_SOLVED,0,b,4))fail("Network send queue full");
@@ -736,6 +922,7 @@ static void process_command(Command c) {
             --state.player_count;
             for(unsigned j=0;j<MP_MAX_PLAYERS-1;j++)if(peers[j].player>(int)i)--peers[j].player;
         }
+        clear_race();
         state.state=MP_LOBBY;
         state.start_ticks=0;
         state.winner_mask=0;
@@ -747,6 +934,7 @@ static void process_command(Command c) {
             state.players[i].score=0;
             state.players[i].elapsed_us=0;
             state.players[i].ready=false;
+            state.players[i].puzzle_index=0;
         }
         cap_rules();
         broadcast_state();
@@ -755,33 +943,35 @@ static void process_command(Command c) {
         if(!puzzle_limit())return;
         cap_rules();
         state.match_id=SDL_GetPerformanceCounter()^own_id;
+        if(!state.match_id)state.match_id=1;
         state.state=MP_PREPARING;
         own_sequence=0;
-        phase_deadline=now_ms()+15000;
+        phase_deadline=now_ms()+PREPARE_MS;
         memset(score_sequences,0,sizeof(score_sequences));
         for(unsigned i=0;i<state.player_count;i++) {
             state.players[i].score=0;
             state.players[i].elapsed_us=0;
             state.players[i].ready=false;
+            state.players[i].puzzle_index=0;
         }
-        broadcast_state();
+        clear_race();
+        if(!prepare_host_race()) {fail("Unable to prepare host puzzle sequence");return;}
+        state.players[0].ready=true;
+        broadcast_state();maybe_start();
     }
-    else if(c.type==C_READY&&state.state==MP_PREPARING) {
-        if(state.is_host) {
-            if(!c.ready||!local_puzzle_count||(state.rules.mode==MP_TARGET_SCORE&&local_puzzle_count<state.rules.target_score)) {
-                fail("No usable local puzzles");
-                return;
-            }
-            state.players[0].ready=true;
-            broadcast_state();
-            maybe_start();
-        }
+    else if(c.type==C_READY&&(state.state==MP_PREPARING||state.state==MP_STARTING||state.state==MP_PLAYING)) {
+        if(!c.ready||!state.race_ready)return;
+        if(state.is_host) {state.players[0].ready=true;broadcast_state();maybe_start();}
         else {
-            uint8_t b[5];
-            b[0]=c.ready;
-            put32(b+1,local_puzzle_count);
+            uint8_t b[5];b[0]=1;put32(b+1,cached_race_count);
             if(!send_frame(&peers[0],W_READY,0,b,5))fail("Network send queue full");
         }
+    }
+    else if(c.type==C_PROGRESS&&(state.state==MP_STARTING||state.state==MP_PLAYING)) {
+        if(c.score>1000000)return;
+        for(unsigned i=0;i<state.player_count;i++)if(state.players[i].id==own_id)state.players[i].puzzle_index=c.score;
+        if(!state.is_host) {uint8_t b[4];put32(b,c.score);if(!send_frame(&peers[0],W_PROGRESS,0,b,4))fail("Network send queue full");}
+        dirty=true;
     }
     else if(c.type==C_SCORE&&(state.state==MP_PLAYING||state.state==MP_FINALIZING)) {
         ++own_sequence;
@@ -798,14 +988,14 @@ static void accept_peer(void) {
     int fd=accept(listener,NULL,NULL);
     if(fd<0)return;
     nonblock(fd);
-    for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++)if(peers[i].fd<0&&state.state==MP_LOBBY) {
+    for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++)if(peers[i].fd<0) {
         peers[i].fd=fd;
         peers[i].last_rx=peers[i].joined_at=now_ms();
         return;
     }
     /* Best effort small rejection; worker owns this nonblocking socket. */
     uint8_t rejected[30]= {
-        'C','N','R','1',4,W_ERROR,0,10
+        'C','N','R','1',PROTOCOL_VERSION,W_ERROR,0,10
     };
     memcpy(rejected+20,"Lobby full",10);
     send(fd,rejected,sizeof(rejected),0);
@@ -852,11 +1042,11 @@ static void service_peer(Peer *p,bool readable,bool writable) {
     p->last_rx=now_ms();
     while(p->rn>=20) {
         size_t len=(size_t)p->rx[6]<<8|p->rx[7];
-        if(memcmp(p->rx,"CNR1",4)||p->rx[4]!=4||len>FRAME_MAX-20) {
+        if(memcmp(p->rx,"CNR1",4)||p->rx[4]!=PROTOCOL_VERSION||len>FRAME_MAX-20) {
             if(!state.is_host) fail("Protocol incompatible");
             else {
                 uint8_t rejected[41]= {
-                    'C','N','R','1',4,W_ERROR,0,21
+                    'C','N','R','1',PROTOCOL_VERSION,W_ERROR,0,21
                 };
                 memcpy(rejected+20,"Protocol incompatible",21);
                 send(p->fd,rejected,sizeof(rejected),0);
@@ -919,6 +1109,7 @@ static int worker(void *unused) {
             scan_at=now_ms()+750;
             local_discover();
         }
+        if(local_mode&&local_host&&now_ms()>=next_advertise) {next_advertise=now_ms()+1000;local_advertise();}
         deadlines();
         publish();
         fd_set r,w;
@@ -932,6 +1123,8 @@ static int worker(void *unused) {
         for(unsigned i=0;i<MP_MAX_PLAYERS-1;i++) {
             Peer *p=&peers[i];
             if(p->fd>=0) {
+                queue_state(p);
+                queue_race(p);
                 queue_icon_chunk(p);
                 FD_SET(p->fd,&r);
                 if(p->connecting||p->tn>p->sent)FD_SET(p->fd,&w);
@@ -963,16 +1156,20 @@ static int worker(void *unused) {
 #endif
     }
     transport_stop();
+    clear_race();
+    free(host_library);host_library=NULL;host_library_count=0;
     return 0;
 }
 bool mp_init(void) {
     if(thread)return true;
     queue_lock=SDL_CreateMutex();
     snapshot_lock=SDL_CreateMutex();
-    if(!queue_lock||!snapshot_lock) {
+    race_lock=SDL_CreateMutex();
+    if(!queue_lock||!snapshot_lock||!race_lock) {
         if(queue_lock)SDL_DestroyMutex(queue_lock);
         if(snapshot_lock)SDL_DestroyMutex(snapshot_lock);
-        queue_lock=snapshot_lock=NULL;
+        if(race_lock)SDL_DestroyMutex(race_lock);
+        queue_lock=snapshot_lock=race_lock=NULL;
         return false;
     }
     memset(&published,0,sizeof(published));
@@ -992,7 +1189,8 @@ bool mp_init(void) {
     if(!thread) {
         SDL_DestroyMutex(queue_lock);
         SDL_DestroyMutex(snapshot_lock);
-        queue_lock=snapshot_lock=NULL;
+        SDL_DestroyMutex(race_lock);
+        queue_lock=snapshot_lock=race_lock=NULL;
         return false;
     }
     return true;
@@ -1002,20 +1200,19 @@ void mp_shutdown(void) {
     atomic_store(&quit,true);
     SDL_WaitThread(thread,NULL);
     thread=NULL;
-    SDL_DestroyMutex(queue_lock);
-    SDL_DestroyMutex(snapshot_lock);
-    queue_lock=snapshot_lock=NULL;
-    race_library=NULL;
-    race_library_count=0;
-    race_sequence_match=0;
+    Command pending;
+    while(dequeue(&pending))if(pending.type==C_LIBRARY)free(pending.library);
+    SDL_DestroyMutex(queue_lock);SDL_DestroyMutex(snapshot_lock);SDL_DestroyMutex(race_lock);
+    queue_lock=snapshot_lock=race_lock=NULL;
 }
-bool mp_begin_local(const char *name) {
-    Command c= {
-        .type=C_LOCAL
-    };
-    snprintf(c.name,sizeof(c.name),"%s",name?name:"PLAYER");
-    return enqueue(c);
+bool mp_begin_local(const char *name) {return mp_discover_local(name);}
+bool mp_begin_local_host(const char *name) {
+    Command c={.type=C_LOCAL,.host=true};snprintf(c.name,sizeof(c.name),"%s",name?name:"PLAYER");return enqueue(c);
 }
+bool mp_discover_local(const char *name) {
+    Command c={.type=C_LOCAL};snprintf(c.name,sizeof(c.name),"%s",name?name:"PLAYER");return enqueue(c);
+}
+bool mp_join_local(uint64_t session_id) {return session_id&&enqueue((Command){.type=C_LOCAL_JOIN,.elapsed=session_id});}
 bool mp_begin_wifi(bool host,const char *ip,uint16_t port,const char *name) {
     Command c= {
         .type=C_WIFI,.host=host,.port=port
@@ -1025,15 +1222,16 @@ bool mp_begin_wifi(bool host,const char *ip,uint16_t port,const char *name) {
     return enqueue(c);
 }
 void mp_stop(void) {
-    Command c= {
-        .type=C_STOP
-    };
     if(!thread)return;
+    ConnectionsPuzzle *discarded[QUEUE_MAX];unsigned count=0;
     SDL_LockMutex(queue_lock);
-    qread=0;
-    qcount=1;
-    queue[0]=c;
+    for(unsigned i=0;i<qcount;i++) {
+        Command *c=&queue[(qread+i)%QUEUE_MAX];
+        if(c->type==C_LIBRARY&&c->library)discarded[count++]=c->library;
+    }
+    qread=0;qcount=1;queue[0]=(Command){.type=C_STOP};
     SDL_UnlockMutex(queue_lock);
+    for(unsigned i=0;i<count;i++)free(discarded[i]);
 }
 bool mp_set_rules(MpRules rules) {
     return enqueue((Command) {
@@ -1044,12 +1242,9 @@ bool mp_set_puzzle_count(unsigned count) {
     if(count>MP_MAX_PUZZLES)return false;
     return enqueue((Command) { .type=C_COUNT,.score=count });
 }
-bool mp_set_library(const ConnectionsPuzzle *puzzles,unsigned count,unsigned entries) {
+bool mp_set_library(ConnectionsPuzzle *puzzles,unsigned count,unsigned entries) {
     if(count>MP_MAX_PUZZLES||entries<count||(!puzzles&&count)||(!count&&puzzles))return false;
-    race_library=puzzles;
-    race_library_count=count;
-    race_sequence_match=0;
-    return mp_set_puzzle_count(count);
+    return enqueue((Command){.type=C_LIBRARY,.library=puzzles,.score=count});
 }
 static uint32_t race_random(uint32_t *seed) {
     *seed^=*seed<<13;
@@ -1058,45 +1253,13 @@ static uint32_t race_random(uint32_t *seed) {
     return *seed;
 }
 bool mp_race_puzzle(uint64_t match_id,unsigned index,ConnectionsPuzzle *out) {
-    if(!thread||!out||!match_id||!race_library||!race_library_count)return false;
-    SDL_LockMutex(snapshot_lock);
-    uint64_t current_match=published.match_id;
-    MpState current_state=published.state;
-    SDL_UnlockMutex(snapshot_lock);
-    if(match_id!=current_match)return false;
-    if(race_sequence_match!=match_id) {
-        if(current_state!=MP_PREPARING)return false;
-        uint64_t entropy=SDL_GetPerformanceCounter()^own_id^match_id;
-        uint32_t seed=(uint32_t)(entropy^(entropy>>32));
-        if(!seed)seed=0x9e3779b9;
-        for(unsigned i=0;i<race_library_count;i++) {
-            race_order[i]=i;
-            for(unsigned j=0;j<CONNECTIONS_WORD_COUNT;j++)race_word_order[i][j]=(uint8_t)j;
-            for(unsigned j=CONNECTIONS_WORD_COUNT-1;j>0;j--) {
-                unsigned k=race_random(&seed)%(j+1);
-                uint8_t swap=race_word_order[i][j];
-                race_word_order[i][j]=race_word_order[i][k];
-                race_word_order[i][k]=swap;
-            }
-        }
-        for(unsigned i=race_library_count-1;i>0;i--) {
-            unsigned j=race_random(&seed)%(i+1);
-            uint32_t swap=race_order[i];race_order[i]=race_order[j];race_order[j]=swap;
-        }
-        race_sequence_match=match_id;
-    }
-    if(current_state!=MP_PREPARING&&current_state!=MP_STARTING&&current_state!=MP_PLAYING)return false;
-    unsigned slot=index%race_library_count;
-    unsigned selected=race_order[slot];
-    const ConnectionsPuzzle *source=&race_library[selected];
-    *out=*source;
-    for(unsigned i=0;i<CONNECTIONS_WORD_COUNT;i++) {
-        unsigned from=race_word_order[selected][i];
-        memcpy(out->words[i],source->words[from],CONNECTIONS_WORD_MAX_LENGTH);
-        out->group_ids[i]=source->group_ids[from];
-    }
-    return true;
+    if(!thread||!out||!match_id)return false;
+    SDL_LockMutex(race_lock);
+    bool ready=cached_race&&cached_race_count&&cached_race_match==match_id;
+    if(ready)*out=cached_race[index%cached_race_count];
+    SDL_UnlockMutex(race_lock);return ready;
 }
+bool mp_set_progress(unsigned index) {return index<=1000000&&enqueue((Command){.type=C_PROGRESS,.score=index});}
 bool mp_return_lobby(void) {
     return enqueue((Command){.type=C_RETURN_LOBBY});
 }
